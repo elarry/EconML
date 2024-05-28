@@ -22,6 +22,15 @@ from ...utilities import (_deprecate_positional, add_intercept,
                           filter_none_kwargs)
 
 
+try:
+    import ray
+except ImportError as exn:
+    from ...utilities import MissingModule
+    ray = MissingModule(
+        "Ray is not a dependency of the base econml package; install econml[ray] or econml[all] to require it, "
+        "or install ray separately, to use functionality that depends on ray", exn)
+
+
 def _get_groups_period_filter(groups, n_periods):
     group_counts = {}
     group_period_filter = {i: [] for i in range(n_periods)}
@@ -40,10 +49,17 @@ class _DynamicModelNuisanceSelector(ModelSelector):
     the residuals as two nuisance parameters.
     """
 
-    def __init__(self, model_y, model_t, n_periods):
+    def __init__(self, model_y, model_t, n_periods, use_ray=False):
         self._model_y = model_y
         self._model_t = model_t
         self.n_periods = n_periods
+        self.use_ray = use_ray
+
+    @ray.remote
+    def _train_with_ray(model, is_selecting, folds, X, W, target):
+        if is_selecting:
+            model.train(is_selecting, folds, X, W, target)
+        return model
 
     def train(self, is_selecting, folds, Y, T, X=None, W=None, sample_weight=None, groups=None):
         """Fit a series of nuisance models for each period or period pairs."""
@@ -85,6 +101,29 @@ class _DynamicModelNuisanceSelector(ModelSelector):
                     assert np.array_equal(_translate_inds(t, test), _translate_inds(0, test))
         else:
             translated_folds = None
+
+        if self.use_ray and is_selecting:
+            model_y_tasks = [self._train_with_ray.remote(self._model_y_trained[t], is_selecting, translated_folds,
+                                                self._index_or_None(X, period_filters[t]),
+                                                self._index_or_None(W, period_filters[t]),
+                                                Y[period_filters[self.n_periods - 1]])
+                            for t in np.arange(self.n_periods)]
+
+            model_t_tasks = [self._train_with_ray.remote(self._model_t_trained[j][t], is_selecting, translated_folds,
+                                                self._index_or_None(X, period_filters[t]),
+                                                self._index_or_None(W, period_filters[t]),
+                                                T[period_filters[j]])
+                            for t in np.arange(self.n_periods) for j in np.arange(t, self.n_periods)]
+
+            model_y_tasks_trained = ray.get(model_y_tasks)
+            model_t_tasks_trained = ray.get(model_t_tasks)
+                       
+            idx = 0
+            for t in np.arange(self.n_periods):
+                self._model_y_trained[t] = model_y_tasks_trained[t]
+                for j in np.arange(t, self.n_periods):
+                    self._model_t_trained[j][t] = model_t_tasks_trained[idx]
+                    idx += 1
 
         for t in np.arange(self.n_periods):
             self._model_y_trained[t].train(
@@ -510,7 +549,9 @@ class DynamicDML(LinearModelFinalCateEstimatorMixin, _OrthoLearner):
                  mc_iters=None,
                  mc_agg='mean',
                  random_state=None,
-                 allow_missing=False):
+                 allow_missing=False,
+                 use_ray=False, 
+                 ray_remote_func_options=None):                 
         self.fit_cate_intercept = fit_cate_intercept
         if linear_first_stages != "deprecated":
             warn("The linear_first_stages parameter is deprecated and will be removed in a future version of EconML",
@@ -527,8 +568,10 @@ class DynamicDML(LinearModelFinalCateEstimatorMixin, _OrthoLearner):
                          mc_iters=mc_iters,
                          mc_agg=mc_agg,
                          random_state=random_state,
-                         allow_missing=allow_missing)
-
+                         allow_missing=allow_missing,
+                         use_ray=use_ray,
+                         ray_remote_func_options=ray_remote_func_options)
+        
     def _gen_allowed_missing_vars(self):
         return ['W'] if self.allow_missing else []
 
@@ -595,7 +638,8 @@ class DynamicDML(LinearModelFinalCateEstimatorMixin, _OrthoLearner):
         return _DynamicModelNuisanceSelector(
             model_t=self._gen_model_t(),
             model_y=self._gen_model_y(),
-            n_periods=self._n_periods)
+            n_periods=self._n_periods,
+            use_ray=self.use_ray)
 
     def _gen_ortho_learner_model_final(self):
         wrapped_final_model = _DynamicFinalWrapper(
